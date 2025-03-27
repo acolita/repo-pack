@@ -1,0 +1,82 @@
+name: Create Debian Package and Release
+
+# Trigger this workflow when a tag starting with 'v' is pushed
+on:
+  push:
+    tags:
+      - 'v*' # Example: v1.0.0, v1.1.0-beta
+
+# Permissions needed by the release action to create a release
+# and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build .deb and Create Release
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout the specific code tagged
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Install necessary build tools and dependencies
+      - name: Set up build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            devscripts \
+            debhelper \
+            fakeroot \
+            libmagic-dev \
+            libssl-dev \
+            lintian \
+            dos2unix # Include just in case of checkout issues
+
+      # 3. (Optional but Recommended) Ensure Unix line endings for scripts
+      #    The checkout action usually handles this, but belt-and-suspenders approach.
+      - name: Ensure Unix line endings
+        run: find . -type f \( -name '*.sh' -o -name 'rules' \) -print0 | xargs -0 dos2unix
+
+      # 4. Ensure our build scripts are executable
+      - name: Make build scripts executable
+        run: chmod +x build_deb.sh debian/rules
+
+      # 5. Run the packaging script (cleans, creates tarball, runs dpkg-buildpackage)
+      - name: Build Debian package using script
+        run: ./build_deb.sh
+        # No need for -us -uc here, not signing in the action
+
+      # 6. Check the generated package for issues using Lintian
+      #    Fail the job if serious errors or warnings are found.
+      - name: Check package with Lintian
+        run: lintian ../*.changes --fail-on error,warning
+
+      # 7. Create a GitHub Release and upload artifacts
+      #    Uses the ncipollo/release-action for convenience.
+      - name: Create GitHub Release
+        id: create_release
+        uses: ncipollo/release-action@v1
+        with:
+          # Artifacts to upload: find all relevant files generated in ../
+          # Adjust glob if your build script output differs slightly.
+          artifacts: "../repo-pack_*.{deb,dsc,debian.tar.xz,orig.tar.gz}"
+          # Tag for the release (comes from the triggering event)
+          tag: ${{ github.ref_name }}
+          # Name for the release
+          name: Release ${{ github.ref_name }}
+          # Body of the release - extract latest changes from debian/changelog
+          body: |
+            Release based on tag ${{ github.ref_name }}
+
+            **Changelog:**
+            ```
+            $(dpkg-parsechangelog --file debian/changelog --show-field Changes)
+            ```
+          # Set to false to automatically publish the release
+          draft: false
+          # Set to false unless this tag represents a pre-release
+          prerelease: false
+          # The GITHUB_TOKEN is automatically provided by Actions
+          # token: ${{ secrets.GITHUB_TOKEN }}
