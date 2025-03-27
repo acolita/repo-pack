@@ -52,8 +52,18 @@ jobs:
       #    Fail the job if serious errors or warnings are found.
       - name: Check package with Lintian
         run: lintian ../*.changes --fail-on error
+        # Add back --fail-on warning if desired after testing
 
-      # 7. Create a GitHub Release and upload artifacts
+      # --- NEW STEP: Extract Changelog ---
+      - name: Extract latest changelog entry
+        id: get_changelog
+        run: |
+          # Use a unique delimiter and the recommended multiline output format
+          echo 'changes<<CHANGELOG_EOF' >> $GITHUB_OUTPUT
+          dpkg-parsechangelog --file debian/changelog --show-field Changes >> $GITHUB_OUTPUT
+          echo 'CHANGELOG_EOF' >> $GITHUB_OUTPUT
+
+      # --- UPDATED STEP 7: Use the output from previous step ---
       - name: Create GitHub Release
         id: create_release
         uses: ncipollo/release-action@v1
@@ -67,13 +77,14 @@ jobs:
             ../repo-pack_*.orig.tar.gz
           tag: ${{ github.ref_name }}
           name: Release ${{ github.ref_name }}
+          # Use the output from the 'get_changelog' step
           body: |
             Release based on tag ${{ github.ref_name }}
 
             **Changelog:**
             ```
-            $(dpkg-parsechangelog --file debian/changelog --show-field Changes)
+            ${{ steps.get_changelog.outputs.changes }}
             ```
           draft: false
           prerelease: false
-          # token: ${{ secrets.GITHUB_TOKEN }} # Default is fine
+          # token: ${{ secrets.GITHUB_TOKEN }}
