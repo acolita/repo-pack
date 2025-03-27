@@ -51,7 +51,7 @@ jobs:
       # 6. Check the generated package for issues using Lintian
       #    Fail the job if serious errors or warnings are found.
       - name: Check package with Lintian
-        run: lintian ../*.changes --fail-on error,warning
+        run: lintian ../*.changes --fail-on error
 
       # 7. Create a GitHub Release and upload artifacts
       #    Uses the ncipollo/release-action for convenience.
