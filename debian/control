@@ -1,0 +1,30 @@
+Source: repo-pack
+Section: utils
+Priority: optional
+Maintainer: Raul Almeida <contato@acolita.com.br>
+Build-Depends: debhelper-compat (= 13),
+               libmagic-dev,
+               libssl-dev
+Standards-Version: 4.6.2
+Homepage: http://github.com/acolita/repo-pack
+Vcs-Git: https://github.com/acolita/repo-pack.git
+Vcs-Browser: https://github.com/acolita/repo-pack
+
+Package: repo-pack
+Architecture: any
+Depends: ${misc:Depends},
+         libmagic1,
+         libssl3
+Description: Flatten and restore directory structures into a single text file
+ repo-pack is a command-line tool that flattens a directory (like a Git
+ repository) into a single, portable text file. It preserves directory
+ structure and text file contents, including SHA-256 checksums for
+ integrity verification.
+ .
+ It automatically detects and skips binary files using libmagic and can
+ be used for feeding codebases to LLMs, creating simple text-based
+ backups, or distributing related text files together.
+ .
+ The tool supports packing a directory to standard output and unpacking
+ an archive file (or standard input) to a specified directory, with
+ optional SHA-256 verification during unpack.
