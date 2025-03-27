@@ -54,19 +54,19 @@ jobs:
         run: lintian ../*.changes --fail-on error
 
       # 7. Create a GitHub Release and upload artifacts
-      #    Uses the ncipollo/release-action for convenience.
       - name: Create GitHub Release
         id: create_release
         uses: ncipollo/release-action@v1
         with:
-          # Artifacts to upload: find all relevant files generated in ../
-          # Adjust glob if your build script output differs slightly.
-          artifacts: "../repo-pack_*.{deb,dsc,debian.tar.xz,orig.tar.gz}"
-          # Tag for the release (comes from the triggering event)
+          # Artifacts to upload: List each pattern explicitly
+          artifacts: |
+            ../repo-pack_*.deb
+            ../repo-pack_*.ddeb
+            ../repo-pack_*.dsc
+            ../repo-pack_*.debian.tar.xz
+            ../repo-pack_*.orig.tar.gz
           tag: ${{ github.ref_name }}
-          # Name for the release
           name: Release ${{ github.ref_name }}
-          # Body of the release - extract latest changes from debian/changelog
           body: |
             Release based on tag ${{ github.ref_name }}
 
@@ -74,9 +74,6 @@ jobs:
             ```
             $(dpkg-parsechangelog --file debian/changelog --show-field Changes)
             ```
-          # Set to false to automatically publish the release
           draft: false
-          # Set to false unless this tag represents a pre-release
           prerelease: false
-          # The GITHUB_TOKEN is automatically provided by Actions
-          # token: ${{ secrets.GITHUB_TOKEN }}
+          # token: ${{ secrets.GITHUB_TOKEN }} # Default is fine
