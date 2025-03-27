@@ -61,8 +61,8 @@ cd ..
 
 # Use tar with excludes relative to the parent directory
 echo "Running tar from: $(pwd)"
-tar --exclude="./${PROJECT_DIR_NAME}/debian" \
-    --exclude="./${PROJECT_DIR_NAME}/.git" \
+tar --exclude="${PROJECT_DIR_NAME}/debian" \
+    --exclude="${PROJECT_DIR_NAME}/.git" \
    -czvf "${ORIG_TARBALL_FILENAME}" "${PROJECT_DIR_NAME}/"
 
 # Check if tarball was created

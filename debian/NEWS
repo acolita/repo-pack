@@ -1,0 +1,5 @@
+repo-pack (1.0.0-1) UNRELEASED; urgency=medium
+
+  * Initial release of the Debian packaging for repo-pack.
+
+ -- Raul Almeida <contato@acolita.com.br>  Thu, 27 Mar 2025 18:46:58 -0300
