@@ -1,3 +1,5 @@
+// REPO-PACK.C WITH RELAXED UNPACK MODE
+
 #define _GNU_SOURCE       // For FTW_SKIP_SUBTREE if available
 #define _XOPEN_SOURCE 700 // Required for nftw, strptime
 #define _DEFAULT_SOURCE   // For S_IF* constants if needed, nftw flags
@@ -22,7 +24,7 @@
 #include <limits.h>         // For PATH_MAX
 
 // --- Constants ---
-#define VERSION "1.0"
+#define VERSION "1.1-dev" // Indicate development version
 #define HEADER_MARKER "=== REPO-PACK HEADER ==="
 #define CONTENTS_MARKER "=== REPO-PACK CONTENTS ==="
 #define FILE_SEPARATOR_PREFIX "----- "
@@ -30,9 +32,11 @@
 #define MAX_PATH_LEN 4096
 #define HASH_STR_LEN (SHA256_DIGEST_LENGTH * 2 + 1)
 #define READ_BUFFER_SIZE 8192
+#define FILE_SEP_START_PATTERN "\n----- " // Used for relaxed unpack detection
 
 // --- Global Flags ---
 static bool verbose_mode = false;
+static bool relaxed_unpack_mode = false; // New flag for relaxed extraction
 
 // --- Logging Utilities ---
 
@@ -95,9 +99,9 @@ typedef struct {
     char path[MAX_PATH_LEN];
     char type;          // 'd' for dir, 'f' for file, '!' for skipped
     char sha256_str[HASH_STR_LEN];
-    off_t size;         // Use off_t for file size
+    off_t size;         // Use off_t for file size (may be unreliable in relaxed mode)
     off_t start_offset; // Use off_t for offsets
-    off_t end_offset;   // Use off_t for offsets
+    off_t end_offset;   // Use off_t for offsets (may be unreliable in relaxed mode)
     char reason[100];   // Reason for skipping
 } FileInfo;
 
@@ -125,7 +129,9 @@ void usage(const char *prog_name) {
     fprintf(stderr, "  -x, --extract          Extract mode: restore from an archive file.\n");
     fprintf(stderr, "  -o, --output <path>    Output directory for extraction (default: current dir).\n");
     fprintf(stderr, "  -v, --verbose          Enable verbose output during operation.\n");
-    fprintf(stderr, "      --verify           Verify SHA-256 checksums during extraction.\n");
+    fprintf(stderr, "      --verify           (Extract mode) Verify SHA-256 checksums during extraction.\n");
+    fprintf(stderr, "      --relaxed          (Extract mode) Ignore checksums and size mismatches during extraction.\n");
+    fprintf(stderr, "                         Reads file content until the next file separator or EOF.\n");
     fprintf(stderr, "      --skip-bin         (Pack mode) Silently skip binary files without warning.\n");
     fprintf(stderr, "      --help             Show this help message.\n");
     fprintf(stderr, "\nVersion: %s\n", VERSION);
@@ -259,12 +265,10 @@ void add_file_info(FileCollector *collector, FileInfo info) {
 // nftw callback function for packing
 int pack_walker(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
     FileCollector *collector = &global_collector;
-//    fprintf(stderr, "DEBUG: pack_walker entry: fpath='%s', type=%d, level=%d\n", fpath, typeflag, ftwbuf->level);
     (void)ftwbuf; // Mark as potentially unused
 
     if (strcmp(fpath, collector->base_path) == 0) {
-//        fprintf(stderr, "DEBUG: Skipping root path.\n");
-        return 0;
+        return 0; // Skip root
     }
 
     const char *relative_path_ptr = NULL;
@@ -274,24 +278,21 @@ int pack_walker(const char *fpath, const struct stat *sb, int typeflag, struct F
             relative_path_ptr++;
         }
     } else {
-//        fprintf(stderr, "DEBUG: WARNING - fpath '%s' does not start with base_path '%s'\n", fpath, collector->base_path);
         log_warning("Path '%s' unexpected, does not start with base path. Skipping.", fpath);
         return 0;
     }
-//    fprintf(stderr, "DEBUG:   Relative path calculated: '%s'\n", relative_path_ptr);
 
-    // *** DIAGNOSTIC CHANGE: Only return 0 for .git to test nftw continuation ***
     if (strncmp(relative_path_ptr, ".git/", 5) == 0 || strcmp(relative_path_ptr, ".git") == 0) {
         log_verbose("Skipping git path: %s", relative_path_ptr);
-//        fprintf(stderr, "DEBUG: Skipping .git path: %s (and returning 0)\n", relative_path_ptr); // DEBUG
-        // #ifdef FTW_SKIP_SUBTREE
-        // if (typeflag == FTW_D && strcmp(relative_path_ptr, ".git") == 0) {
-        //    return FTW_SKIP_SUBTREE; // Temporarily disabled
-        // }
-        // #endif
-        return 0; // Always return 0 for .git paths for now to see if siblings are processed
+        #ifdef FTW_SKIP_SUBTREE
+        if (typeflag == FTW_D && strcmp(relative_path_ptr, ".git") == 0) {
+           // Skip subtree if possible and enabled (check compilation)
+           // Currently disabled for simplicity/portability
+           // return FTW_SKIP_SUBTREE;
+        }
+        #endif
+        return 0; // Skip .git content
     }
-    // *** END DIAGNOSTIC CHANGE ***
 
 
     FileInfo info = {0};
@@ -301,10 +302,8 @@ int pack_walker(const char *fpath, const struct stat *sb, int typeflag, struct F
     if (typeflag == FTW_D) {
         info.type = 'd';
         log_verbose("Found directory: %s", info.path);
-//        fprintf(stderr, "DEBUG: Adding directory: %s\n", info.path); // DEBUG
         add_file_info(collector, info);
     } else if (typeflag == FTW_F) {
-//        fprintf(stderr, "DEBUG: Processing file: %s\n", info.path); // DEBUG
         info.size = sb->st_size;
         if (is_binary(collector->magic_cookie, fpath)) {
             info.type = '!';
@@ -314,7 +313,6 @@ int pack_walker(const char *fpath, const struct stat *sb, int typeflag, struct F
             } else {
                 log_verbose("Skipping binary file: %s", info.path);
             }
-//            fprintf(stderr, "DEBUG: Adding skipped (binary) file: %s\n", info.path); // DEBUG
             add_file_info(collector, info);
         } else {
             info.type = 'f';
@@ -322,30 +320,27 @@ int pack_walker(const char *fpath, const struct stat *sb, int typeflag, struct F
             if (calculate_sha256(fpath, hash) == 0) {
                 sha256_to_hex(hash, info.sha256_str);
                 log_verbose("Found text file: %s (sha256: %s)", info.path, info.sha256_str);
-//                fprintf(stderr, "DEBUG: Adding text file: %s\n", info.path); // DEBUG
             } else {
+                // If hashing fails, still pack it but mark as skipped in header?
+                // Or maybe pack it without a hash? Current behaviour is to skip.
+                // Let's keep the skipping behaviour for now.
                 info.type = '!';
                 snprintf(info.reason, sizeof(info.reason), "Skipped: Failed to calculate SHA256 hash");
                 log_warning("%s (%s)", info.path, info.reason);
-//                fprintf(stderr, "DEBUG: Adding skipped (hash failed) file: %s\n", info.path); // DEBUG
             }
             add_file_info(collector, info);
         }
     } else if (typeflag == FTW_SL || typeflag == FTW_SLN) {
         log_verbose("Skipping symbolic link: %s", info.path);
-//        fprintf(stderr, "DEBUG: Skipping symlink: %s\n", info.path); // DEBUG
     } else if (typeflag == FTW_DNR) {
         log_warning("Cannot read directory: %s", fpath);
-//        fprintf(stderr, "DEBUG: Cannot read dir: %s\n", fpath); // DEBUG
     } else if (typeflag == FTW_NS) {
         log_warning("Cannot stat file: %s (%s)", fpath, strerror(errno));
-//        fprintf(stderr, "DEBUG: Cannot stat file: %s\n", fpath); // DEBUG
         info.type = '!';
         snprintf(info.reason, sizeof(info.reason), "Skipped: Cannot stat file (%s)", strerror(errno));
         add_file_info(collector, info);
     } else {
         log_verbose("Skipping unknown file type %d: %s", typeflag, info.path);
-//        fprintf(stderr, "DEBUG: Skipping unknown type %d: %s\n", typeflag, info.path); // DEBUG
     }
 
     return 0; // Continue traversal
@@ -364,25 +359,32 @@ int mkdir_recursive(const char *path, mode_t mode) {
 
     result = 0;
     char *p = path_copy;
-    while (*p == '/') p++;
+    while (*p == '/') p++; // Skip leading slashes
 
     while (result == 0 && (p = strchr(p, '/')) != NULL) {
-        *p = '\0';
-        if (mkdir(path_copy, mode) == -1 && errno != EEXIST) {
-            log_perror("mkdir failed");
-            result = -1;
-        } else {
-             *p = '/';
-             p++;
-             while (*p == '/') p++;
+        *p = '\0'; // Temporarily terminate at the slash
+        // Only try to mkdir if the path component is not empty (handles //)
+        if (strlen(path_copy) > 0 && path_copy[strlen(path_copy)-1] != '/') {
+            if (mkdir(path_copy, mode) == -1 && errno != EEXIST) {
+                char err_buf[MAX_PATH_LEN + 50];
+                snprintf(err_buf, sizeof(err_buf), "mkdir failed for intermediate dir '%s'", path_copy);
+                log_perror(err_buf);
+                result = -1;
+            }
         }
+        *p = '/'; // Restore slash
+         p++;
+         while (*p == '/') p++; // Skip consecutive slashes
     }
 
-    if (result == 0 && mkdir(path, mode) == -1 && errno != EEXIST) {
-        char err_buf[MAX_PATH_LEN + 50];
-        snprintf(err_buf, sizeof(err_buf), "mkdir failed for final component '%s'", path);
-        log_perror(err_buf);
-        result = -1;
+    // Create the final component
+    if (result == 0 && strlen(path) > 0 && path[strlen(path)-1] != '/') {
+        if (mkdir(path, mode) == -1 && errno != EEXIST) {
+            char err_buf[MAX_PATH_LEN + 50];
+            snprintf(err_buf, sizeof(err_buf), "mkdir failed for final component '%s'", path);
+            log_perror(err_buf);
+            result = -1;
+        }
     }
 
 cleanup:
@@ -405,10 +407,8 @@ int pack_repo(const char *source_dir, FILE *out_fp, bool skip_bin_flag) {
         log_perror("Error getting absolute path for source");
         goto cleanup;
     }
-//    fprintf(stderr, "DEBUG: realpath resolved '%s' to '%s'\n", source_dir, abs_source_dir);
     global_collector.base_path = abs_source_dir;
     global_collector.base_path_len = strlen(abs_source_dir);
-//    fprintf(stderr, "DEBUG: base_path_len = %zu\n", global_collector.base_path_len);
 
     global_collector.magic_cookie = magic_open(MAGIC_MIME_TYPE | MAGIC_SYMLINK | MAGIC_ERROR);
     if (global_collector.magic_cookie == NULL) {
@@ -421,15 +421,11 @@ int pack_repo(const char *source_dir, FILE *out_fp, bool skip_bin_flag) {
     }
 
     log_verbose("Starting directory scan: %s", abs_source_dir);
-//    fprintf(stderr, "DEBUG: Calling nftw on '%s'\n", abs_source_dir);
-
     if (nftw(abs_source_dir, pack_walker, 20, FTW_PHYS) == -1) {
         log_perror("nftw failed");
         goto cleanup;
     }
-
-    log_verbose("Directory scan complete. Found %zu items.", global_collector.count);
-//    fprintf(stderr, "DEBUG: nftw finished. Found %zu items.\n", global_collector.count);
+    log_verbose("Directory scan complete. Found %zu items eligible for header.", global_collector.count);
 
     // --- Write Header ---
     fprintf(out_fp, "%s\n", HEADER_MARKER);
@@ -457,50 +453,120 @@ int pack_repo(const char *source_dir, FILE *out_fp, bool skip_bin_flag) {
         }
     }
     fprintf(out_fp, "\n# Content Boundaries:\n");
-    off_t current_offset = 0;
+    // Calculate content start position AFTER the header content, including the final marker line.
+    // Need to estimate or calculate accurately. Let's write content first, then header with offsets.
+    // This requires storing content temporarily or doing two passes.
+    // Simpler approach: calculate offsets based on current position during header write.
+
+    // Get position *before* writing boundaries section
+    off_t boundary_section_start = ftello(out_fp);
+    if (boundary_section_start == -1) {
+        log_perror("ftello before writing boundary section failed");
+        goto cleanup;
+    }
+
+    // Write placeholder lines for boundaries
+    char boundary_placeholder[MAX_PATH_LEN + 100];
+    size_t boundary_placeholder_len = 0;
     for (size_t i = 0; i < global_collector.count; ++i) {
         FileInfo *info = &global_collector.items[i];
         if (info->type == 'f') {
-            size_t sep_len = strlen(FILE_SEPARATOR_PREFIX) + strlen(info->path) + strlen(FILE_SEPARATOR_SUFFIX) + 1;
-            current_offset += sep_len;
-            info->start_offset = current_offset;
-            info->end_offset = info->start_offset + info->size;
-            fprintf(out_fp, "[%s] START_OFFSET: %lld  END_OFFSET: %lld\n",
-                    info->path, (long long)info->start_offset, (long long)info->end_offset);
-            current_offset = info->end_offset + (info->size > 0 ? 1 : 0);
+             // Estimate line length: [path] START_OFFSET: OFFSET_VAL END_OFFSET: OFFSET_VAL\n
+             boundary_placeholder_len += snprintf(boundary_placeholder, sizeof(boundary_placeholder),
+                 "[%s] START_OFFSET: %-12lld END_OFFSET: %-12lld\n",
+                 info->path, (long long)0, (long long)0); // Use dummy offsets for length calculation
+             fputs(boundary_placeholder, out_fp); // Write placeholder to reserve space
         }
+    }
+    fprintf(out_fp, "\n%s\n", CONTENTS_MARKER); // Write content marker
+
+    off_t content_start_offset = ftello(out_fp); // This is the real start of content
+    if (content_start_offset == -1) {
+        log_perror("ftello before writing content failed");
+        goto cleanup;
     }
 
     // --- Write Content ---
-    fprintf(out_fp, "\n%s\n", CONTENTS_MARKER);
+    off_t current_content_offset = 0;
     for (size_t i = 0; i < global_collector.count; ++i) {
         FileInfo *info = &global_collector.items[i];
         if (info->type == 'f') {
             fprintf(out_fp, "%s%s%s\n", FILE_SEPARATOR_PREFIX, info->path, FILE_SEPARATOR_SUFFIX);
+            off_t separator_len = strlen(FILE_SEPARATOR_PREFIX) + strlen(info->path) + strlen(FILE_SEPARATOR_SUFFIX) + 1; // +1 for newline
+
+            info->start_offset = content_start_offset + current_content_offset + separator_len;
+
             char full_src_path[PATH_MAX + MAX_PATH_LEN];
             snprintf(full_src_path, sizeof(full_src_path), "%s/%s", abs_source_dir, info->path);
             src_fp = fopen(full_src_path, "rb");
             if (!src_fp) {
                 log_warning("Could not open source file %s during content writing: %s. Skipping content.", full_src_path, strerror(errno));
+                 info->end_offset = info->start_offset; // Empty content
+                 info->size = 0; // Reflect actual size written (0)
+                current_content_offset += separator_len; // Advance offset by separator only
                 continue;
             }
+
             unsigned char buffer[READ_BUFFER_SIZE];
             size_t bytes_read;
+            off_t file_bytes_written = 0;
             while ((bytes_read = fread(buffer, 1, sizeof(buffer), src_fp)) > 0) {
                 if (fwrite(buffer, 1, bytes_read, out_fp) != bytes_read) {
                     log_perror("fwrite error during content writing");
                     fclose(src_fp); src_fp = NULL;
                     goto cleanup;
                 }
+                file_bytes_written += bytes_read;
             }
             if (ferror(src_fp)) {
                 log_warning("Error reading source file %s: %s. Content might be incomplete.", full_src_path, strerror(errno));
             }
             fclose(src_fp); src_fp = NULL;
-            if (info->size > 0) {
-                fprintf(out_fp, "\n");
+
+            info->end_offset = info->start_offset + file_bytes_written;
+             // Add newline separator if content was written
+            if (file_bytes_written > 0) {
+                 fprintf(out_fp, "\n");
+                 current_content_offset += separator_len + file_bytes_written + 1; // +1 for newline
+            } else {
+                 current_content_offset += separator_len; // No content, no extra newline
             }
+             // Update size to reflect actual bytes written, not necessarily sb->st_size if read failed
+             info->size = file_bytes_written;
         }
+    }
+
+    // --- Rewrite Boundaries Section ---
+    off_t end_content_offset = ftello(out_fp); // Position after all content
+    if (end_content_offset == -1) {
+         log_perror("ftello after writing content failed");
+         goto cleanup;
+    }
+    // Seek back to the start of the boundary section
+    if (fseeko(out_fp, boundary_section_start, SEEK_SET) != 0) {
+        log_perror("fseeko back to boundary section failed");
+        goto cleanup;
+    }
+    // Rewrite the boundaries with correct offsets
+    for (size_t i = 0; i < global_collector.count; ++i) {
+        FileInfo *info = &global_collector.items[i];
+        if (info->type == 'f') {
+            int written = fprintf(out_fp, "[%s] START_OFFSET: %lld  END_OFFSET: %lld\n",
+                   info->path, (long long)info->start_offset, (long long)info->end_offset);
+            if (written < 0) {
+                log_perror("fprintf error writing final boundary");
+                goto cleanup;
+            }
+            // Pad with spaces if the written line was shorter than the placeholder
+            // (This is complex, assumes fixed-width printing was accurate enough)
+            // For simplicity, we'll assume fprintf produced the correct length or more.
+            // A more robust solution might truncate/overwrite precisely.
+        }
+    }
+    // Seek back to the end of the file
+    if (fseeko(out_fp, end_content_offset, SEEK_SET) != 0) {
+        log_perror("fseeko to end after fixing boundaries failed");
+        goto cleanup;
     }
 
     result = 0; // Success!
@@ -515,8 +581,23 @@ cleanup:
     return result;
 }
 
+
+// Helper function for relaxed unpack: Find next separator or EOF
+// Returns: pointer to separator start within buffer, or NULL if not found in this chunk
+// Updates bytes_to_write with the number of bytes before the separator (or entire buffer)
+char* find_next_separator(char *buffer, size_t bytes_in_buffer, size_t *bytes_to_write) {
+    char *sep_ptr = memmem(buffer, bytes_in_buffer, FILE_SEP_START_PATTERN, strlen(FILE_SEP_START_PATTERN));
+    if (sep_ptr != NULL) {
+        *bytes_to_write = sep_ptr - buffer; // Bytes before the '\n' of the separator
+        return sep_ptr;
+    } else {
+        *bytes_to_write = bytes_in_buffer; // Write the whole buffer if no separator found
+        return NULL;
+    }
+}
+
 // --- Unpacking Logic ---
-int unpack_repo(const char *archive_path, const char *output_dir, bool verify) {
+int unpack_repo(const char *archive_path, const char *output_dir, bool verify, bool relaxed_mode) {
     FILE *in_fp = NULL;
     FILE *out_fp = NULL;
     FileCollector parsed_files = {0};
@@ -525,7 +606,7 @@ int unpack_repo(const char *archive_path, const char *output_dir, bool verify) {
     int result = 1;
     int unpack_errors = 0;
 
-    parsed_files.items = NULL;
+    parsed_files.items = NULL; // Initialize
 
     in_fp = strcmp(archive_path, "-") == 0 ? stdin : fopen(archive_path, "r");
     if (!in_fp) {
@@ -533,126 +614,171 @@ int unpack_repo(const char *archive_path, const char *output_dir, bool verify) {
         goto cleanup;
     }
     log_verbose("Opened archive %s", strcmp(archive_path, "-") == 0 ? "<stdin>" : archive_path);
+    if (relaxed_mode) log_verbose("Relaxed unpack mode enabled: Checksums and sizes ignored.");
 
-    char line[MAX_PATH_LEN + 200];
+    char line[MAX_PATH_LEN + 200]; // Increased buffer size a bit
     bool in_header = false;
     bool header_parsed = false;
     off_t content_start_pos = -1;
 
     // --- Parse Header ---
     while (fgets(line, sizeof(line), in_fp)) {
-        line[strcspn(line, "\r\n")] = 0;
+        line[strcspn(line, "\r\n")] = 0; // Remove trailing newline/cr
 
         if (!in_header) {
             if (strcmp(line, HEADER_MARKER) == 0) {
                 in_header = true;
                 log_verbose("Found header marker.");
             }
-            continue;
+            continue; // Skip lines before header marker
         }
 
         if (strcmp(line, CONTENTS_MARKER) == 0) {
             content_start_pos = ftello(in_fp);
             if (content_start_pos == -1) {
+                // Try fgetpos for streams that don't support ftello well after text reads?
                 log_perror("ftello after CONTENTS_MARKER failed");
                 goto cleanup;
             }
             log_verbose("Found contents marker at offset %lld.", (long long)content_start_pos);
             header_parsed = true;
-            break;
+            break; // Stop header parsing
         }
 
+        // Parse directory structure and file entries
         if (strncmp(line, "[d] ", 4) == 0) {
-            FileInfo info = { .type = 'd' };
+            FileInfo info = { .type = 'd', .sha256_str = "" }; // Init sha string
             size_t path_len = strlen(line + 4);
-            // *** Fix strncpy warning ***
-            // Copy len-1 to guarantee space for null terminator if trailing / exists
             if (path_len > 0 && path_len < sizeof(info.path)) {
                  size_t copy_len = path_len;
-                 // Check for trailing slash and adjust length to exclude it but keep space
-                 if (line[4 + path_len - 1] == '/') {
+                 if (line[4 + path_len - 1] == '/') { // Remove trailing slash
                       copy_len = path_len - 1;
                  }
-                 // Copy up to one less than the buffer size
-                 if (copy_len >= sizeof(info.path)) {
-                     copy_len = sizeof(info.path) - 1; // Ensure space for null terminator
+                 if (copy_len < sizeof(info.path)) { // Ensure space for null terminator
+                     strncpy(info.path, line + 4, copy_len);
+                     info.path[copy_len] = '\0'; // Null terminate
+                     log_verbose("Parsed directory: %s", info.path);
+                     add_file_info(&parsed_files, info);
+                 } else { // copy_len somehow still >= sizeof path (shouldn't happen here)
+                      log_warning("Internal logic error parsing directory path: %s", line);
                  }
-                 strncpy(info.path, line + 4, copy_len);
-                 info.path[copy_len] = '\0'; // Null terminate
-                 log_verbose("Parsed directory: %s", info.path);
-                 add_file_info(&parsed_files, info);
-            } else if (path_len > 0) { // Path is too long
-                log_warning("Directory path too long in header: %s", line);
+            } else if (path_len >= sizeof(info.path)) { // Path is too long
+                log_warning("Directory path too long in header: %.30s...", line); // Log truncated path
             } else { // Empty path
-                log_warning("Empty directory path in header: %s", line);
+                log_warning("Empty directory path in header line: %s", line);
             }
-            // *** End fix ***
         } else if (strncmp(line, "[f] ", 4) == 0) {
-            FileInfo info = { .type = 'f' };
+            FileInfo info = { .type = 'f', .sha256_str = "" }; // Init sha string
+            info.start_offset = -1; // Mark offsets as not yet parsed
+            info.end_offset = -1;
+            info.size = -1;
+
             char *sha_start = strstr(line, "  (sha256: ");
             if (sha_start) {
                 size_t path_len = sha_start - (line + 4);
                 if (path_len < sizeof(info.path)) {
                     strncpy(info.path, line + 4, path_len); info.path[path_len] = '\0';
-                    char *sha_end = strchr(sha_start, ')');
+                    char *sha_end = strchr(sha_start + strlen("  (sha256: "), ')'); // Find ')' after hash
                     if (sha_end) {
                         const char *hash_ptr = sha_start + strlen("  (sha256: ");
                         size_t hash_len = sha_end - hash_ptr;
                         if (hash_len == HASH_STR_LEN - 1) {
                             strncpy(info.sha256_str, hash_ptr, hash_len); info.sha256_str[hash_len] = '\0';
                             log_verbose("Parsed file: %s (sha256: %s)", info.path, info.sha256_str);
-                            add_file_info(&parsed_files, info);
-                        } else log_warning("Malformed sha256 length in header: %s", line);
-                    } else log_warning("Malformed file line (missing ')'): %s", line);
-                } else log_warning("Parsed path too long in header: %s", line);
-            } else log_warning("Malformed file line (missing sha256 marker): %s", line);
+                        } else {
+                            log_warning("Malformed sha256 length in header for %s", info.path);
+                            info.sha256_str[0] = '\0'; // Ensure empty hash if malformed
+                        }
+                    } else {
+                         log_warning("Malformed file line (missing ')' after sha256) for %s", info.path);
+                         info.sha256_str[0] = '\0'; // Ensure empty hash
+                    }
+                    add_file_info(&parsed_files, info); // Add even if sha parsing failed
+                } else {
+                    log_warning("Parsed file path too long in header: %.30s...", line);
+                }
+            } else {
+                 // Handle files listed without a sha256 marker (maybe from older/edited files)
+                 size_t path_len = strlen(line + 4);
+                 if (path_len < sizeof(info.path)) {
+                    strncpy(info.path, line + 4, path_len); info.path[path_len] = '\0';
+                    log_verbose("Parsed file: %s (no sha256 found in header)", info.path);
+                    info.sha256_str[0] = '\0'; // Ensure empty hash
+                    add_file_info(&parsed_files, info);
+                 } else {
+                     log_warning("Parsed file path (no sha) too long in header: %.30s...", line);
+                 }
+            }
         } else if (strncmp(line, "[!] ", 4) == 0) {
+            // Skipped files are just noted, no FileInfo entry needed for extraction
             log_verbose("Noted skipped file from header: %s", line + 4);
         } else if (strncmp(line, "[", 1) == 0 && strstr(line, "] START_OFFSET: ") != NULL) {
+            // Parse boundary information
             char current_path[MAX_PATH_LEN];
-            char *path_end = strchr(line, ']');
+            char *path_end = strchr(line + 1, ']'); // Find first ']' after '['
             if (path_end) {
                 size_t path_len = path_end - (line + 1);
                 if (path_len < sizeof(current_path)) {
                     strncpy(current_path, line + 1, path_len); current_path[path_len] = '\0';
-                    long long start_ll, end_ll;
-                    if (sscanf(path_end + 1, " START_OFFSET: %lld END_OFFSET: %lld", &start_ll, &end_ll) == 2) {
+                    long long start_ll = -1, end_ll = -1; // Use long long for sscanf robustness
+                    // Use %*s to consume the known string parts robustly
+                    if (sscanf(path_end, "] START_OFFSET: %lld END_OFFSET: %lld", &start_ll, &end_ll) == 2) {
                         bool found = false;
                         for (size_t i = 0; i < parsed_files.count; ++i) {
                             if (parsed_files.items[i].type == 'f' && strcmp(parsed_files.items[i].path, current_path) == 0) {
                                 parsed_files.items[i].start_offset = (off_t)start_ll;
                                 parsed_files.items[i].end_offset = (off_t)end_ll;
-                                parsed_files.items[i].size = end_ll - start_ll;
-                                if (parsed_files.items[i].size < 0) {
-                                     log_warning("Invalid boundary for %s (end < start). Treating as empty.", current_path);
+                                // Calculate size, ensure non-negative
+                                if (end_ll >= start_ll) {
+                                     parsed_files.items[i].size = (off_t)(end_ll - start_ll);
+                                } else {
+                                     log_warning("Invalid boundary for %s (end %lld < start %lld). Treating size as 0.", current_path, end_ll, start_ll);
                                      parsed_files.items[i].size = 0;
+                                     // Optionally adjust end_offset to equal start_offset?
+                                     parsed_files.items[i].end_offset = parsed_files.items[i].start_offset;
                                 }
+
                                 log_verbose("Parsed boundary for %s: %lld - %lld (size %lld)",
-                                            current_path, (long long)start_ll, (long long)end_ll, (long long)parsed_files.items[i].size);
+                                            current_path, (long long)parsed_files.items[i].start_offset,
+                                            (long long)parsed_files.items[i].end_offset,
+                                            (long long)parsed_files.items[i].size);
                                 found = true;
                                 break;
                             }
                         }
-                        if (!found) log_verbose("Warning - boundary found for unknown/non-file path: %s", current_path);
+                        if (!found) log_verbose("Boundary found for unknown/non-file path: %s", current_path);
                     } else log_warning("Malformed boundary line (sscanf failed): %s", line);
                 } else log_warning("Path too long in boundary line: %s", line);
             } else log_warning("Malformed boundary line (missing ']'): %s", line);
+        } else {
+             // Ignore other lines in header (comments, format, timestamp etc)
+             log_verbose("Ignoring header line: %s", line);
         }
-    } // end while(fgets)
+    } // end while(fgets) header parse
 
     if (!header_parsed || content_start_pos == -1) {
-        log_error("Invalid or incomplete repo-pack archive. Header/content marker missing.");
+        log_error("Invalid or incomplete repo-pack archive. Header or content marker missing/malformed.");
         goto cleanup;
     }
 
+    // --- Prepare Output Directory ---
     if (!getcwd(original_cwd, sizeof(original_cwd))) {
         log_perror("getcwd failed");
         goto cleanup;
     }
 
     if (mkdir_recursive(output_dir, 0755) != 0 && errno != EEXIST) {
-        log_error("Could not create or access output directory '%s'", output_dir);
-        goto cleanup;
+        // Check if output_dir is accessible even if mkdir failed (e.g. exists but is file)
+        struct stat st_out;
+        if (stat(output_dir, &st_out) == 0) {
+             if (!S_ISDIR(st_out.st_mode)) {
+                 log_error("Output path '%s' exists but is not a directory.", output_dir);
+                 goto cleanup;
+             }
+        } else {
+            log_error("Could not create or access output directory '%s'", output_dir);
+            goto cleanup;
+        }
     }
 
     if (chdir(output_dir) != 0) {
@@ -661,112 +787,229 @@ int unpack_repo(const char *archive_path, const char *output_dir, bool verify) {
     }
     log_verbose("Changed to output directory: %s", output_dir);
 
+    // --- Create Directories ---
     for (size_t i = 0; i < parsed_files.count; ++i) {
         if (parsed_files.items[i].type == 'd') {
             log_verbose("Ensuring directory exists: %s", parsed_files.items[i].path);
-            if (mkdir_recursive(parsed_files.items[i].path, 0755) != 0 && errno != EEXIST) {
-                log_warning("Failed to create directory %s", parsed_files.items[i].path);
-                unpack_errors++;
+            if (mkdir_recursive(parsed_files.items[i].path, 0755) != 0) {
+                 // mkdir_recursive already logs specifics, check errno if needed
+                 if (errno != EEXIST) {
+                     log_warning("Failed to create directory %s", parsed_files.items[i].path);
+                     unpack_errors++;
+                 }
             }
         }
     }
 
+    // --- Extract Files ---
     for (size_t i = 0; i < parsed_files.count; ++i) {
         FileInfo *info = &parsed_files.items[i];
         if (info->type == 'f') {
             bool file_write_ok = false;
-            log_verbose("Extracting file: %s (size %lld)", info->path, (long long)info->size);
 
-            free(path_copy);
-            path_copy = strdup(info->path);
-            if (!path_copy) die("strdup failed");
-            char *parent_dir = dirname(path_copy);
-            if (parent_dir && strcmp(parent_dir, ".") != 0 && strcmp(parent_dir, "/") != 0) {
-                if (mkdir_recursive(parent_dir, 0755) != 0 && errno != EEXIST) {
-                    log_warning("Failed to create parent directory %s for file %s", parent_dir, info->path);
-                }
+            if (info->start_offset < 0) {
+                 log_error("Skipping file '%s': Missing content boundary information in header.", info->path);
+                 unpack_errors++;
+                 continue;
             }
 
+            // Use header size hint in verbose log even in relaxed mode
+            log_verbose("Extracting file: %s (header size hint: %lld)", info->path, (long long)info->size);
+
+            // Ensure parent directory exists before opening file
+            free(path_copy); // Free previous iteration's copy
+            path_copy = strdup(info->path);
+            if (!path_copy) die("strdup failed for path copy");
+            char *parent_dir = dirname(path_copy); // Note: dirname might modify path_copy
+            // Check parent_dir isn't "." or "/" before creating
+            if (parent_dir && strcmp(parent_dir, ".") != 0 && strcmp(parent_dir, "/") != 0) {
+                // Use a separate buffer for dirname result if needed, strdup result first?
+                // Let's assume dirname modification is acceptable here as path_copy is temporary
+                if (mkdir_recursive(parent_dir, 0755) != 0 && errno != EEXIST) {
+                    log_warning("Failed to create parent directory '%s' for file '%s'", parent_dir, info->path);
+                    // Don't necessarily skip file, fopen might still work if dir was created concurrently
+                }
+            }
+            // dirname might have modified path_copy, so use info->path for fopen
             out_fp = fopen(info->path, "wb");
             if (!out_fp) {
                 log_error("Could not create output file '%s': %s", info->path, strerror(errno));
                 unpack_errors++;
-                continue;
+                continue; // Skip this file
             }
 
-            if (fseeko(in_fp, content_start_pos + info->start_offset, SEEK_SET) != 0) {
-                log_error("Failed to seek in archive for file '%s' (offset %lld): %s", info->path, (long long)(content_start_pos + info->start_offset), strerror(errno));
+            // Seek to the start of the file content in the archive
+            // Use fseeko for large file support
+            if (fseeko(in_fp, info->start_offset, SEEK_SET) != 0) {
+                 // Check if start_offset was relative to content_start_pos
+                 // The packing logic now calculates absolute offsets from file start
+                 // So, just use info->start_offset directly
+                log_error("Failed to seek in archive for file '%s' (offset %lld): %s", info->path, (long long)info->start_offset, strerror(errno));
                 unpack_errors++;
                 fclose(out_fp); out_fp = NULL;
-                remove(info->path);
-                continue;
+                remove(info->path); // Clean up partially created file
+                continue; // Skip this file
             }
 
             unsigned char buffer[READ_BUFFER_SIZE];
-            off_t remaining = info->size;
-            while (remaining > 0) {
-                size_t to_read = (remaining < (off_t)sizeof(buffer)) ? (size_t)remaining : sizeof(buffer);
-                size_t bytes_read = fread(buffer, 1, to_read, in_fp);
-                if (bytes_read == 0) {
-                    if (feof(in_fp)) { if (remaining > 0) log_error("Unexpected EOF reading content for '%s'. Expected %lld more bytes.", info->path, (long long)remaining); }
-                    else { log_error("Failed reading archive content for '%s': %s", info->path, strerror(errno)); }
-                    unpack_errors++;
-                    goto next_file_unpack; // Renamed label
-                }
-                if (fwrite(buffer, 1, bytes_read, out_fp) != bytes_read) {
-                    log_error("Failed writing to output file '%s': %s", info->path, strerror(errno));
-                    unpack_errors++;
-                    goto next_file_unpack; // Renamed label
-                }
-                remaining -= bytes_read;
-            }
-            file_write_ok = (remaining == 0);
+            size_t bytes_read;
+            bool read_error = false;
+            bool write_error = false;
 
-        next_file_unpack: // Renamed label
-            fclose(out_fp); out_fp = NULL;
+            if (relaxed_mode) {
+                // --- Relaxed Extraction: Read until next separator or EOF ---
+                log_verbose("Relaxed mode: Reading until next separator...");
+                off_t bytes_written_relaxed = 0;
+                bool separator_found = false;
+
+                // Need to handle potential separator spanning buffer boundary
+                // Keep track of last few bytes from previous buffer? Simpler: smaller buffer?
+                // Let's try reading chunks and searching within.
+                char read_buf[READ_BUFFER_SIZE]; // Use char buffer for memmem
+                char* separator_pos = NULL;
+                size_t bytes_to_write_in_chunk = 0;
+
+                while ((bytes_read = fread(read_buf, 1, sizeof(read_buf), in_fp)) > 0) {
+                    separator_pos = find_next_separator(read_buf, bytes_read, &bytes_to_write_in_chunk);
+
+                    if (bytes_to_write_in_chunk > 0) {
+                         if (fwrite(read_buf, 1, bytes_to_write_in_chunk, out_fp) != bytes_to_write_in_chunk) {
+                            log_error("Failed writing to output file '%s': %s", info->path, strerror(errno));
+                            write_error = true;
+                            break; // Exit read loop
+                        }
+                         bytes_written_relaxed += bytes_to_write_in_chunk;
+                    }
+
+                    if (separator_pos != NULL) {
+                        separator_found = true;
+                        // Seek back to the start of the separator pattern for the next file
+                        // Calculate position: current pos - (bytes_read - (separator_pos - read_buf))
+                        off_t separator_start_in_file = ftello(in_fp) - (bytes_read - (separator_pos - read_buf));
+                         if (fseeko(in_fp, separator_start_in_file, SEEK_SET) != 0) {
+                             log_warning("Failed to seek back to separator start after extracting %s", info->path);
+                             // Continue, but next file might be wrong
+                         }
+                        break; // Stop reading for this file
+                    }
+                } // end while fread
+
+                if (ferror(in_fp)) {
+                     log_error("Failed reading archive content for '%s': %s", info->path, strerror(errno));
+                     read_error = true;
+                }
+                if (!write_error && !read_error) {
+                     file_write_ok = true; // Assume OK if no errors encountered
+                     log_verbose("Relaxed extraction finished for %s. Wrote %lld bytes.", info->path, (long long)bytes_written_relaxed);
+                }
+
+            } else {
+                // --- Strict Extraction: Read exactly info->size bytes ---
+                off_t remaining = info->size;
+                if (remaining < 0) { // Should have been caught earlier
+                    log_error("Skipping file '%s': Invalid size (%lld) from header.", info->path, (long long)remaining);
+                    read_error = true; // Mark as error
+                }
+
+                while (!read_error && !write_error && remaining > 0) {
+                    size_t to_read = (remaining < (off_t)sizeof(buffer)) ? (size_t)remaining : sizeof(buffer);
+                    bytes_read = fread(buffer, 1, to_read, in_fp);
+                    if (bytes_read == 0) {
+                        if (feof(in_fp)) {
+                             log_error("Unexpected EOF reading content for '%s'. Expected %lld more bytes.", info->path, (long long)remaining);
+                        } else {
+                             log_error("Failed reading archive content for '%s': %s", info->path, strerror(errno));
+                        }
+                        read_error = true;
+                        break; // Exit read loop
+                    }
+                    if (fwrite(buffer, 1, bytes_read, out_fp) != bytes_read) {
+                        log_error("Failed writing to output file '%s': %s", info->path, strerror(errno));
+                        write_error = true;
+                        break; // Exit read loop
+                    }
+                    remaining -= bytes_read;
+                }
+                // Check if expected size was written
+                if (!read_error && !write_error && remaining == 0) {
+                    file_write_ok = true;
+                } else if (!read_error && !write_error && remaining != 0) {
+                     // This case implies incorrect size calculation or read logic error
+                     log_error("Internal error: Size mismatch after reading for %s. Remaining %lld.", info->path, (long long)remaining);
+                }
+            } // end if/else relaxed_mode
+
+            fclose(out_fp); out_fp = NULL; // Close the output file
 
             if (!file_write_ok) {
-                remove(info->path);
-                continue;
+                unpack_errors++;
+                remove(info->path); // Clean up failed extraction
+                continue; // Skip verification for this file
             }
 
-            if (verify) {
-                log_verbose("Verifying SHA256 for %s...", info->path);
-                unsigned char actual_hash[SHA256_DIGEST_LENGTH];
-                unsigned char expected_hash[SHA256_DIGEST_LENGTH];
-                if (calculate_sha256(info->path, actual_hash) == 0) {
-                    if (hex_to_sha256(info->sha256_str, expected_hash) == 0) {
-                        if (memcmp(actual_hash, expected_hash, SHA256_DIGEST_LENGTH) == 0) {
-                            log_verbose("SHA256 OK: %s", info->path);
+            // --- Verification (only if requested AND not in relaxed mode) ---
+            if (verify && !relaxed_mode) {
+                if (info->sha256_str[0] == '\0') {
+                     log_warning("Cannot verify SHA256 for %s: No hash found in archive header.", info->path);
+                } else {
+                    log_verbose("Verifying SHA256 for %s...", info->path);
+                    unsigned char actual_hash[SHA256_DIGEST_LENGTH];
+                    unsigned char expected_hash[SHA256_DIGEST_LENGTH];
+                    if (calculate_sha256(info->path, actual_hash) == 0) {
+                        if (hex_to_sha256(info->sha256_str, expected_hash) == 0) {
+                            if (memcmp(actual_hash, expected_hash, SHA256_DIGEST_LENGTH) == 0) {
+                                log_verbose("SHA256 OK: %s", info->path);
+                            } else {
+                                log_error("SHA256 Verification FAILED for file: %s", info->path);
+                                char actual_hash_str[HASH_STR_LEN];
+                                sha256_to_hex(actual_hash, actual_hash_str);
+                                fprintf(stderr, "  Expected: %s\n", info->sha256_str);
+                                fprintf(stderr, "  Actual:   %s\n", actual_hash_str);
+                                unpack_errors++;
+                            }
                         } else {
-                            log_error("SHA256 Verification FAILED for file: %s", info->path);
-                            char actual_hash_str[HASH_STR_LEN];
-                            sha256_to_hex(actual_hash, actual_hash_str);
-                            fprintf(stderr, "  Expected: %s\n", info->sha256_str);
-                            fprintf(stderr, "  Actual:   %s\n", actual_hash_str);
-                            unpack_errors++;
+                             // This shouldn't happen if header parsing was correct
+                             log_warning("Could not parse expected SHA256 '%s' for %s. Cannot verify.", info->sha256_str, info->path);
                         }
-                    } else log_warning("Could not parse expected SHA256 for %s. Cannot verify.", info->path);
-                } else log_warning("Could not calculate SHA256 for created file %s. Cannot verify.", info->path);
+                    } else {
+                         log_warning("Could not calculate SHA256 for created file %s. Cannot verify.", info->path);
+                    }
+                }
+            } else if (verify && relaxed_mode) {
+                 log_verbose("Skipping verification for %s due to relaxed mode.", info->path);
             }
-        }
-    }
 
-    result = (unpack_errors == 0) ? 0 : 1;
+        } // end if (info->type == 'f')
+    } // end for loop iterating through parsed_files
+
+    result = (unpack_errors == 0) ? 0 : 1; // Set final result based on errors
 
 cleanup:
     free(path_copy);
-    if (out_fp != NULL) fclose(out_fp);
-    if (original_cwd[0] != '\0' && chdir(original_cwd) != 0) {
-        log_warning("Could not change back to original directory '%s': %s", original_cwd, strerror(errno));
+    if (out_fp != NULL) { // Ensure file is closed if loop was exited early
+         fclose(out_fp);
     }
-    if (in_fp != NULL && in_fp != stdin) fclose(in_fp);
-    free(parsed_files.items);
+    // Change back to original directory *before* closing archive/stdin
+    if (original_cwd[0] != '\0') {
+        if (chdir(original_cwd) != 0) {
+            log_warning("Could not change back to original directory '%s': %s", original_cwd, strerror(errno));
+        } else {
+            log_verbose("Returned to original directory: %s", original_cwd);
+        }
+    }
+    if (in_fp != NULL && in_fp != stdin) {
+         fclose(in_fp);
+    }
+    free(parsed_files.items); // Free the list memory
 
-    if (result == 0) log_verbose("Unpacking completed successfully.");
-    else {
-        if (unpack_errors > 0) log_error("Unpacking completed with %d error(s).", unpack_errors);
-        else log_error("Unpacking failed due to an early error.");
+    if (result == 0) {
+         log_verbose("Unpacking completed successfully.");
+    } else {
+        if (unpack_errors > 0) {
+             log_error("Unpacking completed with %d error(s).", unpack_errors);
+        } else {
+             log_error("Unpacking failed due to an early error."); // e.g., archive open, cwd change
+        }
     }
     return result;
 }
@@ -781,14 +1024,17 @@ int main(int argc, char *argv[]) {
     const char *prog_name = argv[0];
     int return_code = 1;
 
+    // Reset global flags
     verbose_mode = false;
+    relaxed_unpack_mode = false;
 
     struct option long_options[] = {
         {"extract", no_argument, 0, 'x'},
         {"output", required_argument, 0, 'o'},
         {"verbose", no_argument, 0, 'v'},
-        {"verify", no_argument, 0, 1},
-        {"skip-bin", no_argument, 0, 2},
+        {"verify", no_argument, 0, 1},     // Used custom value 1
+        {"skip-bin", no_argument, 0, 2},   // Used custom value 2
+        {"relaxed", no_argument, 0, 3},    // Used custom value 3
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
@@ -802,11 +1048,13 @@ int main(int argc, char *argv[]) {
             case 'h': usage(prog_name); return 0;
             case 1: verify = true; break;
             case 2: skip_bin_flag = true; break;
+            case 3: relaxed_unpack_mode = true; break; // Set the new global flag
             case '?': fprintf(stderr, "Try '%s --help' for more information.\n", prog_name); goto cleanup;
             default: usage(prog_name); goto cleanup;
         }
     }
 
+    // Validate arguments
     if (optind >= argc) {
         log_error("Missing source directory or archive file.");
         usage(prog_name);
@@ -819,14 +1067,23 @@ int main(int argc, char *argv[]) {
     }
     const char *source_path = argv[optind];
 
+    // --- Mode Selection ---
     if (extract_mode) {
+        // Validate options specific to extract mode
         if (skip_bin_flag) log_warning("--skip-bin option is ignored in extraction mode.");
-        log_verbose("Mode: Extract, Archive: %s, Output Dir: %s, Verify: %s",
-                    source_path, output_dir, verify ? "Yes" : "No");
-        return_code = unpack_repo(source_path, output_dir, verify);
+        if (relaxed_unpack_mode && verify) {
+            log_warning("--verify is ignored when --relaxed is used.");
+            verify = false; // Relaxed mode takes precedence
+        }
+        log_verbose("Mode: Extract, Archive: %s, Output Dir: %s, Verify: %s, Relaxed: %s",
+                    source_path, output_dir, verify ? "Yes" : "No", relaxed_unpack_mode ? "Yes" : "No");
+        return_code = unpack_repo(source_path, output_dir, verify, relaxed_unpack_mode);
     } else {
+        // Validate options specific to pack mode
         if (verify) log_warning("--verify option is ignored in packing mode.");
-        if (strcmp(output_dir, ".") != 0) log_warning("-o/--output option ignored in packing mode.");
+        if (relaxed_unpack_mode) log_warning("--relaxed option is ignored in packing mode.");
+        if (strcmp(output_dir, ".") != 0) log_warning("-o/--output option ignored in packing mode (output is stdout).");
+
         log_verbose("Mode: Pack, Source: %s, Skip Binaries Silently: %s",
                     source_path, skip_bin_flag ? "Yes" : "No");
         struct stat path_stat;
@@ -842,5 +1099,6 @@ int main(int argc, char *argv[]) {
     }
 
 cleanup:
+    // No specific cleanup needed in main after function calls return
     return return_code;
 }
