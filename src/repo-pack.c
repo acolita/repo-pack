@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>        // For strcasecmp
 #include <stdbool.h>
 #include <stdarg.h>         // For variadic functions (logging)
 #include <getopt.h>
@@ -24,7 +25,7 @@
 #include <limits.h>         // For PATH_MAX
 
 // --- Constants ---
-#define VERSION "1.1-dev" // Indicate development version
+#define VERSION "1.1.0" // Release version
 #define HEADER_MARKER "=== REPO-PACK HEADER ==="
 #define CONTENTS_MARKER "=== REPO-PACK CONTENTS ==="
 #define FILE_SEPARATOR_PREFIX "----- "
@@ -229,12 +230,35 @@ cleanup:
 }
 
 
+// Known text file extensions
+static const char *text_exts[] = {
+#include "../text-exts.inc"
+    NULL // Terminator
+};
+
+// Known text MIME type patterns
+static const char *text_mimes[] = {
+#include "../text-mimes.inc"
+    NULL // Terminator
+};
+
 // Check if a file is likely binary using libmagic
 bool is_binary(magic_t magic_cookie, const char *filepath) {
     const char *magic_full = magic_file(magic_cookie, filepath);
     if (magic_full == NULL) {
         log_warning("Cannot determine type of %s: %s", filepath, magic_error(magic_cookie));
         return true; // Treat as binary if unsure
+    }
+
+    // Check for programming files extensions
+    const char *ext = strrchr(filepath, '.');
+    if (ext != NULL) {
+        for (const char **p = text_exts; *p != NULL; p++) {
+            if (strcasecmp(ext, *p) == 0) {
+                log_verbose("Treating as text due to extension: %s", ext);
+                return false; // Treat as text
+            }
+        }
     }
 
     // Simplistic check based on previous logic
@@ -245,6 +269,15 @@ bool is_binary(magic_t magic_cookie, const char *filepath) {
     if (strstr(magic_full, "empty") != NULL) {
         return false; // Empty files are not binary
     }
+    
+    // Additional MIME type checks for programming files
+    for (const char **p = text_mimes; *p != NULL; p++) {
+        if (strstr(magic_full, *p) != NULL) {
+            log_verbose("Treating as text due to MIME type match: %s", magic_full);
+            return false; // These are programming files, treat as text
+        }
+    }
+    
     return true; // If not text or empty, assume binary
 }
 

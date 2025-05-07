@@ -1,3 +1,11 @@
+repo-pack (1.1.0-1) UNRELEASED; urgency=medium
+
+  * Added improved text file detection using file extensions and MIME types
+  * Added relaxed mode for unpacking to handle partially corrupted archives
+  * Enhanced binary file detection for common programming languages
+
+ -- Raul Almeida <contato@acolita.com.br>  Tue, 07 May 2024 17:30:00 +0000
+
 repo-pack (1.0.0-1) UNRELEASED; urgency=medium
 
   * Initial release of the Debian packaging for repo-pack.

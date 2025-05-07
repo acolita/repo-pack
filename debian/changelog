@@ -1,3 +1,11 @@
+repo-pack (1.1.0-1) UNRELEASED; urgency=medium
+
+  * Improved text file detection with extension and MIME type matching
+  * Added relaxed unpacking mode to handle corrupted archives
+  * Added support for more programming file extensions
+
+ -- Raul Almeida <contato@acolita.com.br>  Tue, 07 May 2024 17:30:00 +0000
+
 repo-pack (1.0.0-1) UNRELEASED; urgency=medium
 
   * Initial release.

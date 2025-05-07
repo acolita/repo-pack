@@ -31,8 +31,18 @@ repo-pack
 *.swo
 .#*
 
+# Test files
+test-dir/
+test-extract/
+test-output.pack
+simple-test/
+simple-test-extract/
+simple-output.pack
+
 # IDE specific files
 .vscode/
 .idea/
 *.suo
 *.user
+
+**/.claude/settings.local.json
